@@ -141,7 +141,7 @@ Requires QGIS or OSGeo4W (for `gdalwarp` / `gdaltransform` / `gdaladdo`).
 ### Typical session
 
 ```bash
-python tithe_downloader.py discover                      # once (a few hours)
+python tithe_downloader.py discover                      # only run once (takes a few hours)
 python tithe_downloader.py list --search "parish name"   # find target maps
 python tithe_downloader.py download --pids "..." --warp  # download and georeference
 python tithe_downloader.py status                        # check progress
