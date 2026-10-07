@@ -59,6 +59,7 @@ python tithe_downloader.py <command>
 | `tidy` | Remove legacy sidecar files (`.gcps.vrt`, `.jgw`/`.tfw`, `.prj`, ...) so every map folder holds the same files. Dry run unless `--apply`. |
 | `geopackage` | Bundle every downloaded parcel-point file into `tithe_maps/parcels.gpkg` for QGIS (one layer per county), in **EPSG:27700** with `easting`/`northing` columns. Add `--split` for one file per county, or `--county X` for a subset. Includes computed `area_hectares` and `rent_decimal_pounds` columns alongside the original imperial units. |
 | `export-toolkit` | Export sheet(s) for the Cadastral Map Vectorisation Toolkit: a north-up **EPSG:27700** GeoTIFF at 0.5 m/px plus a matching seed-point GeoPackage, written into the toolkit folder. See below. |
+| `merge` | Merge maps downloaded on another machine into this database: `merge --from <their tithe_maps folder>` (dry run) then add `--apply`. See below. |
 | `quality` | Mark maps as `high`, `low`, or `excluded`. `download` skips `low` and `excluded` maps by default. |
 | `status` / `export` | Show download progress or export the database as CSV. |
 
@@ -209,6 +210,35 @@ georeferencing, but image and seeds are internally consistent, which is what the
 watershed step needs.
 
 Requires QGIS or OSGeo4W (for `gdalwarp` / `gdaltransform` / `gdaladdo`).
+
+### Merging downloads from another machine
+
+`merge` brings maps downloaded elsewhere (another computer running this script)
+into this database without copying the other machine's database over yours:
+
+```bash
+python tithe_downloader.py merge --from "D:/other_machine/tithe_maps"            # dry run
+python tithe_downloader.py merge --from "D:/other_machine/tithe_maps" --apply    # do it
+```
+
+`--from` is the other machine's `tithe_maps` folder (the one containing
+`tithe_maps.db` and `downloads/`). It is only ever read.
+
+- Only the scan and `.parcels.geojson` are copied. The `.vrt` and pyramids are
+  regenerated here in BNG, so the other machine's old sidecars never arrive.
+- Maps you already have are kept untouched; only missing ones are imported.
+- Each scan is checked against the dimensions its database row expects, so a
+  partly-copied file is skipped, not imported.
+- The GeoJSON always travels with the scan, because its `pixel_x`/`pixel_y`
+  depend on the download's `--scale`.
+- Missing titles / canvas IDs / dimensions are filled from the other database
+  (saving API calls); your quality flags are never overwritten.
+- Safe to repeat. `--move` moves scans instead of copying them.
+- Back up `tithe_maps/tithe_maps.db` first, and don't run it while another
+  download is running.
+
+To avoid the two machines downloading the same maps, give each its own list
+(`download --from-file targets.txt`) and run `discover` on only one of them.
 
 ### Typical session
 

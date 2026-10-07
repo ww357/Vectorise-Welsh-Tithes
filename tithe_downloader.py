@@ -57,6 +57,8 @@ Other commands / flags
   georeference --pid 4634773        (re)build GeoJSON + VRT + world file
   georeference --refetch            ignore cached GeoJSON, re-pull from API
   tidy [--apply] [--include-warped] list (or delete) legacy sidecar clutter
+  merge --from <tithe_maps dir>     bring maps downloaded elsewhere into this
+                                    database (dry run unless --apply)
 """
 
 import os
@@ -277,12 +279,13 @@ def _norm_sql(col):
     return expr
 
 
-def map_paths(row):
-    """Return (folder, stem) for a map record's output files."""
+def map_paths(row, root=None):
+    """Return (folder, stem) for a map record's output files.
+    root: a downloads directory other than this machine's (used by `merge`)."""
     county = safe_name(row["county"] or "Unknown_County")
     parish = safe_name(row["parish"] or "Unknown_Parish")
     stem   = f"{parish}_{row['map_pid']}"
-    return DOWNLOADS_DIR / county / stem, stem
+    return (root or DOWNLOADS_DIR) / county / stem, stem
 
 
 def parcel_pixel_centre(props):
@@ -1246,6 +1249,171 @@ def cmd_tidy(args):
           + ("" if args.apply else "  Re-run with --apply to delete."))
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MERGE -- bring maps downloaded on another machine into this database
+# ──────────────────────────────────────────────────────────────────────────────
+# Only the scan and the parcels GeoJSON are copied (plus the DB row, with paths
+# rewritten for this machine). Everything derived -- .vrt, pyramids, GeoPackage
+# -- is regenerated here, so the other machine's old sidecars never come across.
+# The source is only ever read. Safe to repeat: maps already present are skipped.
+
+_IMAGE_EXTS = (".jpg", ".jpeg", ".tiff", ".tif", ".png")
+_META_COLS = ("title", "date", "scale", "canvas_id", "width", "height", "handle_url")
+
+
+def _find_source_image(src_downloads, row):
+    folder, stem = map_paths(row, src_downloads)
+    for ext in _IMAGE_EXTS:
+        if (folder / f"{stem}{ext}").exists():
+            return folder / f"{stem}{ext}"
+    pid = row["map_pid"]       # folder layout differs on older versions: search by PID
+    for ext in _IMAGE_EXTS:
+        hits = sorted(src_downloads.glob(f"*/*_{pid}/*_{pid}{ext}"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _image_size_ok(img, row):
+    """True if the image matches the dimensions the source DB expects."""
+    scale = (row["scale_factor"] if "scale_factor" in row.keys() else 1) or 1
+    if not (row["width"] and row["height"]):
+        return True, None
+    want = (math.ceil(row["width"] / scale), math.ceil(row["height"] / scale))
+    try:
+        with Image.open(img) as im:
+            got = im.size
+    except Exception as exc:
+        return False, f"unreadable ({exc})"
+    return (abs(got[0] - want[0]) <= 1 and abs(got[1] - want[1]) <= 1), \
+        f"{got[0]}x{got[1]}px, expected {want[0]}x{want[1]}"
+
+
+def cmd_merge(args):
+    src_root = Path(args.source).expanduser()
+    src_db = src_root / "tithe_maps.db"
+    if not src_db.exists():
+        logging.error(f"No tithe_maps.db in {src_root} -- point --from at the "
+                      "other machine's 'tithe_maps' folder (the one holding the .db).")
+        return
+    src_downloads = src_root / "downloads"
+    apply = args.apply
+
+    sconn = sqlite3.connect(f"file:{src_db.as_posix()}?mode=ro", uri=True)
+    sconn.row_factory = sqlite3.Row
+    conn = get_conn()
+    local = {r["map_pid"]: r for r in conn.execute("SELECT * FROM maps")}
+    tag = "" if apply else "[dry run] "
+
+    imported, kept, meta_filled, new_rows, problems = [], 0, 0, 0, 0
+    for srow in sconn.execute("SELECT * FROM maps ORDER BY county, parish"):
+        pid = srow["map_pid"]
+        lrow = local.get(pid)
+        label = f"{srow['county']} / {srow['parish']} (pid={pid})"
+
+        # 1. catalogue row unknown here -> add it
+        if lrow is None:
+            new_rows += 1
+            if apply:
+                cols = [c for c in srow.keys() if c not in ("image_path", "parcels_path")]
+                conn.execute(
+                    f"INSERT INTO maps ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                    [srow[c] for c in cols])
+                conn.commit()
+                lrow = conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+                local[pid] = lrow
+                if lrow["status"] in ("downloaded", "georeferenced"):
+                    conn.execute("UPDATE maps SET status='ready' WHERE map_pid=?", (pid,))
+                    conn.commit()
+                    lrow = conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+                    local[pid] = lrow
+            logging.info(f"  {tag}new catalogue entry: {label}")
+
+        # 2. fill gaps in metadata / quality flag (never overwrite what we have)
+        if lrow is not None and apply:
+            gaps = {c: srow[c] for c in _META_COLS
+                    if lrow[c] in (None, "") and srow[c] not in (None, "")}
+            if lrow["quality"] is None and srow["quality"] is not None:
+                gaps["quality"] = srow["quality"]
+            if gaps:
+                conn.execute(f"UPDATE maps SET {', '.join(f'{c}=?' for c in gaps)} "
+                             "WHERE map_pid=?", [*gaps.values(), pid])
+                if lrow["status"] == "discovered" and "canvas_id" in gaps:
+                    conn.execute("UPDATE maps SET status='ready' WHERE map_pid=? "
+                                 "AND status='discovered'", (pid,))
+                conn.commit()
+                meta_filled += 1
+
+        # 3. scan + parcels
+        if srow["status"] not in ("downloaded", "georeferenced"):
+            continue
+        if lrow is not None and _has_image_on_disk(lrow):
+            kept += 1
+            continue
+        img = _find_source_image(src_downloads, srow)
+        if not img:
+            logging.warning(f"  skip {label}: source says downloaded but no image found")
+            problems += 1
+            continue
+        ok, detail = _image_size_ok(img, srow)
+        if not ok:
+            logging.warning(f"  skip {label}: image looks incomplete ({detail})")
+            problems += 1
+            continue
+
+        folder, stem = map_paths(lrow if lrow is not None else srow)
+        dest_img = folder / f"{stem}{img.suffix.lower()}"
+        dest_gj = folder / f"{stem}.parcels.geojson"
+        src_gj = img.parent / f"{img.stem}.parcels.geojson"
+        scale = (srow["scale_factor"] if "scale_factor" in srow.keys() else 1) or 1
+        mb = img.stat().st_size / 1e6
+        logging.info(f"  {tag}import {label}: {img.name} ({mb:.0f} MB, scale x{scale})")
+        imported.append(pid)
+        if not apply:
+            continue
+
+        folder.mkdir(parents=True, exist_ok=True)
+        transfer = shutil.move if args.move else shutil.copy2
+        transfer(str(img), str(dest_img))
+
+        # Pixel coordinates in the GeoJSON are tied to the image's scale, so the
+        # GeoJSON must come from the same download as the scan.
+        local_scale = None
+        if dest_gj.exists():
+            try:
+                local_scale = (json.loads(dest_gj.read_text(encoding="utf-8"))
+                               .get("metadata", {}).get("scale_factor", 1))
+            except (OSError, ValueError):
+                pass
+        if src_gj.exists() and (not dest_gj.exists() or local_scale != scale):
+            shutil.copy2(str(src_gj), str(dest_gj))
+        conn.execute(
+            "UPDATE maps SET image_path=?, parcels_path=COALESCE(?, parcels_path), "
+            "status='downloaded', scale_factor=?, downloaded_date=COALESCE(?, downloaded_date) "
+            "WHERE map_pid=?",
+            (str(dest_img), str(dest_gj) if dest_gj.exists() else None, scale,
+             srow["downloaded_date"], pid))
+        conn.commit()
+
+    sconn.close()
+    logging.info(f"\n{tag}Merge summary: {len(imported)} map(s) to import, "
+                 f"{kept} already here (kept), {new_rows} new catalogue row(s), "
+                 f"{meta_filled} row(s) had metadata/quality filled, {problems} problem(s).")
+
+    if not apply:
+        logging.info("Nothing changed. Re-run with --apply to merge.")
+        conn.close()
+        return
+
+    # Derive the BNG .vrt + pyramids for what we just brought in.
+    for i, pid in enumerate(imported, 1):
+        row = conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+        logging.info(f"\n[{i}/{len(imported)}] Georeferencing {row['county']} / {row['parish']}")
+        process_parcels_and_georef(conn, row)
+    conn.close()
+    logging.info("\nMerge complete.")
+
+
 def _quality_filter(args):
     if getattr(args, "include_low", False):
         return "(quality IS NULL OR quality IN ('high','low'))"
@@ -2086,6 +2254,16 @@ def main():
     p.add_argument("--include-warped", action="store_true",
                    help="Also remove old WGS84 *_warped.tif rasters")
 
+    p = sub.add_parser(
+        "merge", help="Merge maps downloaded on another machine into this database "
+                      "(dry run unless --apply)")
+    p.add_argument("--from", dest="source", required=True,
+                   help="The other machine's 'tithe_maps' folder (the one containing "
+                        "tithe_maps.db and downloads/)")
+    p.add_argument("--apply", action="store_true", help="Actually copy/merge")
+    p.add_argument("--move", action="store_true",
+                   help="Move scans out of the source instead of copying (saves disk)")
+
     p = sub.add_parser("quality", help="List maps or set a quality flag")
     p.add_argument("--pid", type=int)
     p.add_argument("--set", choices=["high", "low", "excluded", "none"])
@@ -2097,7 +2275,7 @@ def main():
     {
         "discover": cmd_discover, "metadata": cmd_metadata,
         "download": cmd_download, "list": cmd_list, "parcels": cmd_parcels,
-        "coverage": cmd_coverage, "tidy": cmd_tidy,
+        "coverage": cmd_coverage, "tidy": cmd_tidy, "merge": cmd_merge,
         "georeference": cmd_georeference, "geopackage": cmd_geopackage,
         "export-toolkit": cmd_export_toolkit, "quality": cmd_quality,
         "status": cmd_status, "export": cmd_export,
