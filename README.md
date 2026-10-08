@@ -183,14 +183,33 @@ python tithe_downloader.py export-toolkit --pid 4634773 \
     --toolkit-dir "C:\path\to\Claude Toolkit Development"
 ```
 
-Writes two files **inside the `--toolkit-dir` folder** (not `tithe_maps/`),
-named after the parish (spaces become underscores; override with
-`--sheet-name`):
+Writes three files **inside the `--toolkit-dir` folder** (not `tithe_maps/`).
+The sheet ID is **`{Parish}_{pid}`** (e.g. `Cheriton_4665980`): parish names are
+not unique across Wales (1,074 maps, 1,036 distinct names), so the PID keeps
+every sheet separate. `--sheet-name` overrides it for a single map.
 
 | File | Contents |
 |------|----------|
 | `data/raw/<SHEET>/<SHEET>.tif` | North-up GeoTIFF, EPSG:27700, 0.5 m/px, tiled + DEFLATE, with overview pyramids |
 | `data/parcel_points/<SHEET>_points.gpkg` | Single point layer, EPSG:27700, one seed per parcel, with a `rowid` column for the toolkit's attribute join |
+| `data/raw/<SHEET>/<SHEET>.json` | Provenance: map PID, county, parish, georeferencing RMS, GCP count, resolution, and a fingerprint of the inputs |
+
+**Selecting maps.** Besides `--pid` / `--county`, use `--pids "4665980,Llanengan"`
+or `--from-file targets.txt`, and filter with `--quality high`,
+`--max-rms 30` (metres), and `--min-parcels 50`. Maps flagged `excluded` are
+skipped unless named explicitly. Skipped maps are logged with the reason.
+
+**Safe to re-run.**
+- A sheet that is already exported and unchanged is skipped (and reported).
+- A sheet is **never overwritten by a different map** — the `.json` records
+  which PID owns it.
+- If the parcels or georeferencing have changed since the export (the
+  fingerprint no longer matches), the raster and points would disagree, so it
+  refuses until you add `--overwrite`.
+- A `.tif` with no `.json` (made by an older version, or an interrupted run)
+  can't be verified, so it also needs `--overwrite`. The warp is written to a
+  temporary file and renamed only on success, so a crash never leaves a
+  half-written raster that looks valid.
 
 The toolkit picks the points file up automatically from the sheet name — no
 `config.yaml` change is needed. Then run its pipeline as normal, starting with
@@ -210,6 +229,15 @@ georeferencing, but image and seeds are internally consistent, which is what the
 watershed step needs.
 
 Requires QGIS or OSGeo4W (for `gdalwarp` / `gdaltransform` / `gdaladdo`).
+
+### Moving the database to another folder or machine
+
+Move the **whole `tithe_maps` folder** (the database *and* `downloads/`) so it
+sits next to `tithe_downloader.py` — the script always looks for
+`tithe_maps/` beside itself. Copy it while no download is running. The database
+stores file paths as absolute paths, so the first command you run in the new
+location automatically re-points them (you'll see a "Re-pointed stored file
+paths" line); it's safe to repeat.
 
 ### Merging downloads from another machine
 
